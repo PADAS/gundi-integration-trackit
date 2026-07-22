@@ -5,6 +5,7 @@ from typing import List, Optional
 
 import httpx
 import pydantic
+import stamina
 
 
 logger = logging.getLogger(__name__)
@@ -76,9 +77,10 @@ async def _post(session, base_url, endpoint, *, params=None, headers=None, json=
     try:
         return response.json()
     except ValueError as e:
-        raise TrackitBaseException(
-            f"TrackIt '{endpoint}' endpoint returned a non-JSON response: {response.text[:500]}", e
-        ) from e
+        # Log the body server-side for debugging, but keep it out of the
+        # exception message, which is surfaced in activity events.
+        logger.error(f"TrackIt '{endpoint}' returned a non-JSON body: {response.text[:500]}")
+        raise TrackitBaseException(f"TrackIt '{endpoint}' endpoint returned a non-JSON response", e) from e
 
 
 class TrackitVehicle(pydantic.BaseModel):
@@ -133,6 +135,7 @@ class TrackitVehicle(pydantic.BaseModel):
             return None
 
 
+@stamina.retry(on=httpx.TransportError, attempts=3, wait_initial=1.0, wait_max=10.0)
 async def get_token(base_url: str, username: str, password: pydantic.SecretStr) -> str:
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
         parsed_response = await _post(
@@ -143,7 +146,7 @@ async def get_token(base_url: str, username: str, password: pydantic.SecretStr) 
         )
 
     if not isinstance(parsed_response, dict):
-        raise TrackitBaseException(f"Unexpected login response from TrackIt: {parsed_response}")
+        raise TrackitBaseException("Unexpected login response from TrackIt (non-object JSON body)")
 
     token = (parsed_response.get("data") or {}).get("token")
     # The API stringifies numerics elsewhere in its payloads, so accept "1" as
@@ -151,12 +154,16 @@ async def get_token(base_url: str, username: str, password: pydantic.SecretStr) 
     # required — a token alongside result != 1 is treated as a failed login.
     result_ok = str(parsed_response.get("result")).strip() == "1"
     if not token or not result_ok:
+        # Only the server's own error message — never the username or the raw
+        # response payload (which can carry a token) — reaches the exception,
+        # since it is surfaced in the portal and activity logs.
         raise TrackitUnauthorizedException(
-            f"Login failed for username {username}. Response: {parsed_response.get('message') or parsed_response}"
+            f"TrackIt login failed. Server message: {parsed_response.get('message') or '(none)'}"
         )
     return token
 
 
+@stamina.retry(on=httpx.TransportError, attempts=3, wait_initial=1.0, wait_max=10.0)
 async def get_live_data(
         base_url: str,
         token: str,
@@ -179,19 +186,23 @@ async def get_live_data(
         )
 
     if not isinstance(parsed_response, dict) or "root" not in parsed_response:
-        message = parsed_response.get("message") if isinstance(parsed_response, dict) else str(parsed_response)
+        message = parsed_response.get("message") if isinstance(parsed_response, dict) else None
         if message and "no company found" in str(message).lower():
             raise TrackitNotFoundException(f"No Company Found for company_names '{company_names}'")
-        raise TrackitBaseException(f"Unexpected response from TrackIt live data endpoint: {parsed_response}")
+        raise TrackitBaseException(
+            f"Unexpected response from TrackIt live data endpoint. Server message: {message or '(none)'}"
+        )
 
     raw_vehicles = (parsed_response.get("root") or {}).get("VehicleData") or []
 
-    # Parse each vehicle independently so one malformed row (e.g. a null IMEI or
-    # an unparseable field) is skipped rather than aborting the whole pull.
+    # Parse each vehicle independently so one malformed row (e.g. a null IMEI,
+    # an unparseable field, or a non-dict entry) is skipped rather than
+    # aborting the whole pull.
     vehicles = []
     for raw in raw_vehicles:
         try:
             vehicles.append(TrackitVehicle.parse_obj(raw))
         except pydantic.ValidationError as e:
-            logger.warning(f"Skipping malformed vehicle row (imei={raw.get('Imeino')!r}): {e}")
+            imei = raw.get("Imeino") if isinstance(raw, dict) else raw
+            logger.warning(f"Skipping malformed vehicle row (imei={imei!r}): {e}")
     return vehicles

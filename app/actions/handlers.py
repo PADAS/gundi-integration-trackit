@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import httpx
 
@@ -30,6 +31,28 @@ OBSERVATIONS_BATCH_SIZE = 200
 # clock errors: they are skipped rather than sent or stored, so a single bogus
 # future timestamp can't poison the per-device high-watermark permanently.
 MAX_FUTURE_SKEW = timedelta(hours=24)
+# Cap on concurrent Redis operations, so a large fleet can't open one
+# connection per vehicle in a single burst.
+MAX_CONCURRENT_STATE_OPS = 25
+
+
+async def _gather_limited(coros, limit=MAX_CONCURRENT_STATE_OPS):
+    """Run coroutines concurrently under a concurrency cap.
+
+    All coroutines run to completion (no orphaned in-flight tasks on failure);
+    the first exception, if any, is raised after everything has settled.
+    """
+    semaphore = asyncio.Semaphore(limit)
+
+    async def run(coro):
+        async with semaphore:
+            return await coro
+
+    results = await asyncio.gather(*[run(coro) for coro in coros], return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
 
 
 def has_valid_position(vehicle: client.TrackitVehicle) -> bool:
@@ -41,15 +64,23 @@ def has_valid_position(vehicle: client.TrackitVehicle) -> bool:
     return True
 
 
-def parse_watermark(stored: str) -> datetime:
-    """Parse a stored watermark to a naive datetime for offset-independent comparison.
+def parse_watermark(stored: str, device_tz: timezone) -> Optional[datetime]:
+    """Parse a stored watermark to a naive device-local datetime.
 
-    Watermarks are stored as the raw device timestamp (naive). Values written by
-    an earlier version were UTC-aware; drop the tzinfo so the comparison never
-    mixes naive and aware datetimes (which would raise).
+    Watermarks are stored as the raw device timestamp (naive). Values written
+    by an earlier version were UTC-aware — convert those back to device-local
+    time with the configured offset so the comparison stays in one timescale.
+    An unparseable value is treated as absent (send + overwrite) so one corrupt
+    key can't turn the pull into a permanent crash loop.
     """
-    dt = datetime.fromisoformat(stored)
-    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    try:
+        dt = datetime.fromisoformat(stored)
+    except (ValueError, TypeError):
+        logger.warning(f"Unparseable stored watermark '{stored}'; treating as absent")
+        return None
+    if dt.tzinfo:
+        return dt.astimezone(device_tz).replace(tzinfo=None)
+    return dt
 
 
 def transform(vehicle: client.TrackitVehicle, recorded_at: datetime) -> dict:
@@ -110,64 +141,75 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     )
     logger.info(f"-- Extracted {len(vehicles)} vehicles for integration ID: {integration_id} --")
 
-    # Prefetch every device's watermark in one concurrent batch instead of a
-    # sequential Redis round-trip per vehicle.
-    imeis = [vehicle.imei for vehicle in vehicles]
-    states = await asyncio.gather(*[
-        state_manager.get_state(integration_id=integration_id, action_id="pull_observations", source_id=imei)
-        for imei in imeis
-    ])
-    state_by_imei = dict(zip(imeis, states))
-
-    observations = []
-    raw_time_by_imei = {}
-    vehicles_skipped = 0
+    # Filter invalid rows and collapse duplicate IMEIs (a vehicle can appear
+    # more than once in one snapshot) to the row with the newest fix, so two
+    # rows can't race the same watermark key or regress it.
+    vehicles_without_position = 0
+    latest_by_imei = {}
     for vehicle in vehicles:
         if not has_valid_position(vehicle):
-            vehicles_skipped += 1
+            vehicles_without_position += 1
             logger.warning(f"Skipping vehicle {vehicle.imei} (no valid position or GPS time)")
             continue
+        current = latest_by_imei.get(vehicle.imei)
+        if current is None or vehicle.gps_actual_time > current.gps_actual_time:
+            latest_by_imei[vehicle.imei] = vehicle
+    unique_vehicles = list(latest_by_imei.values())
 
+    # Prefetch the remaining devices' watermarks concurrently (bounded).
+    states = await _gather_limited([
+        state_manager.get_state(integration_id=integration_id, action_id="pull_observations", source_id=vehicle.imei)
+        for vehicle in unique_vehicles
+    ])
+
+    new_items = []  # (observation, raw device-time watermark) pairs
+    vehicles_future_skewed = 0
+    for vehicle, device_state in zip(unique_vehicles, states):
         # Dedup on the raw device timestamp so it is independent of the
         # configured UTC offset — changing the offset can't silently gap data.
-        stored = (state_by_imei.get(vehicle.imei) or {}).get("latest_gps_time")
-        if stored and vehicle.gps_actual_time <= parse_watermark(stored):
-            logger.info(f"Skipping vehicle {vehicle.imei} (no new position since {stored})")
-            continue
+        stored = (device_state or {}).get("latest_gps_time")
+        if stored:
+            watermark = parse_watermark(stored, device_tz)
+            if watermark and vehicle.gps_actual_time <= watermark:
+                logger.info(f"Skipping vehicle {vehicle.imei} (no new position since {stored})")
+                continue
 
         recorded_at = vehicle.gps_actual_time.replace(tzinfo=device_tz).astimezone(timezone.utc)
         if recorded_at > now + MAX_FUTURE_SKEW:
-            vehicles_skipped += 1
+            vehicles_future_skewed += 1
             logger.warning(
                 f"Skipping vehicle {vehicle.imei}: timestamp {recorded_at.isoformat()} is too far "
                 f"in the future (check the GPS Timestamp UTC Offset config)"
             )
             continue
 
-        observations.append(transform(vehicle, recorded_at))
-        raw_time_by_imei[vehicle.imei] = vehicle.gps_actual_time.isoformat()
+        new_items.append((transform(vehicle, recorded_at), vehicle.gps_actual_time.isoformat()))
 
-    if not observations:
+    result = {
+        "observations_extracted": 0,
+        "vehicles_without_position": vehicles_without_position,
+        "vehicles_future_skewed": vehicles_future_skewed,
+    }
+    if not new_items:
         logger.info(f"No new observations to extract for integration ID: {integration_id}")
-        return {"observations_extracted": 0, "vehicles_skipped": vehicles_skipped}
+        return result
 
-    observations_extracted = 0
-    for i, batch in enumerate(generate_batches(observations, OBSERVATIONS_BATCH_SIZE)):
+    for i, batch in enumerate(generate_batches(new_items, OBSERVATIONS_BATCH_SIZE)):
         logger.info(f"Sending observations batch #{i}: {len(batch)} observations. Integration ID: {integration_id}")
-        await send_observations_to_gundi(observations=batch, integration_id=integration_id)
-        observations_extracted += len(batch)
+        await send_observations_to_gundi(observations=[obs for obs, _ in batch], integration_id=integration_id)
+        result["observations_extracted"] += len(batch)
 
         # Persist watermarks for this batch as soon as it is delivered, so a
         # later batch failing cannot cause already-sent observations to be
         # re-delivered as duplicates on the next run.
-        await asyncio.gather(*[
+        await _gather_limited([
             state_manager.set_state(
                 integration_id=integration_id,
                 action_id="pull_observations",
-                state={"latest_gps_time": raw_time_by_imei[obs["source"]]},
+                state={"latest_gps_time": watermark},
                 source_id=obs["source"],
             )
-            for obs in batch
+            for obs, watermark in batch
         ])
 
-    return {"observations_extracted": observations_extracted, "vehicles_skipped": vehicles_skipped}
+    return result

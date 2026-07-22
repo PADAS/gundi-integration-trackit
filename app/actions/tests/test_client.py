@@ -1,4 +1,3 @@
-import httpx
 import pytest
 import pydantic
 import respx
@@ -75,6 +74,22 @@ async def test_get_token_bad_credentials():
 
     with pytest.raises(TrackitUnauthorizedException):
         await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("bad"))
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_token_failure_message_does_not_leak_credentials():
+    # A failed login must never surface the username or any token from the
+    # raw response in the exception message (it reaches portal/activity logs).
+    respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(
+        json={"result": 0, "data": {"token": "leaked-token-abc"}, "message": ""}
+    )
+
+    with pytest.raises(TrackitUnauthorizedException) as exc_info:
+        await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("bad"))
+
+    assert "leaked-token-abc" not in str(exc_info.value)
+    assert "user@test.org" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -198,12 +213,12 @@ async def test_get_live_data_skips_malformed_rows():
     good = VEHICLE_DATA
     bad_missing_imei = {**VEHICLE_DATA, "Imeino": "--"}  # required field normalized to None
     respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
-        json={"root": {"VehicleData": [good, bad_missing_imei]}}
+        json={"root": {"VehicleData": [good, bad_missing_imei, "not-a-dict", None]}}
     )
 
     vehicles = await get_live_data(BASE_URL, "token123", 37, "Chewore")
 
-    # The malformed row is dropped; the good one still comes through.
+    # Malformed rows (including non-dict entries) are dropped; the good one survives.
     assert len(vehicles) == 1
     assert vehicles[0].imei == "353742376164273"
 

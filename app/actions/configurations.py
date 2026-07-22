@@ -16,7 +16,11 @@ from app.services.utils import (
 )
 
 
-UTC_OFFSET_REGEX = re.compile(r"^(?:UTC\s*)?([+-]?)(\d{1,2})(?::([0-5]\d))?$", re.IGNORECASE)
+# Hours limited to 0-14 so the portal-side pattern rejects out-of-range
+# offsets at save time, matching the range check in utc_offset_to_tzinfo.
+# Case-sensitive on purpose: the JSON-schema `pattern` keyword (ajv) doesn't
+# carry regex flags, so the backend must accept exactly what the portal does.
+UTC_OFFSET_REGEX = re.compile(r"^(?:UTC\s*)?([+-]?)(1[0-4]|0?\d)(?::([0-5]\d))?$")
 
 
 def utc_offset_to_tzinfo(offset: str) -> timezone:
