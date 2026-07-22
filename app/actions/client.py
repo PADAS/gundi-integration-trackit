@@ -53,12 +53,37 @@ def handle_httpx_error(e: httpx.HTTPStatusError):
     raise e
 
 
+async def _post(session, base_url, endpoint, *, params=None, headers=None, json=None) -> dict:
+    """POST to the TrackIt webservice and return the parsed JSON body.
+
+    Centralizes error-status mapping and guards against non-JSON responses
+    (the query-string-routed endpoint returns HTML/plain text on some errors),
+    which would otherwise raise an unhandled JSONDecodeError out of the caller.
+    """
+    request_params = {"token": endpoint}
+    if params:
+        request_params.update(params)
+    try:
+        response = await session.post(base_url, params=request_params, headers=headers, json=json)
+        if response.is_error:
+            logger.error(f"Error in '{endpoint}' endpoint. Response body: {response.text}")
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        handle_httpx_error(e)
+
+    try:
+        return response.json()
+    except ValueError as e:
+        raise TrackitBaseException(
+            f"TrackIt '{endpoint}' endpoint returned a non-JSON response: {response.text[:500]}", e
+        ) from e
+
+
 class TrackitVehicle(pydantic.BaseModel):
     imei: str = pydantic.Field(alias="Imeino")
     latitude: Optional[float] = pydantic.Field(default=None, alias="Latitude")
     longitude: Optional[float] = pydantic.Field(default=None, alias="Longitude")
     gps_actual_time: Optional[datetime] = pydantic.Field(default=None, alias="GPSActualTime")
-    device_datetime: Optional[datetime] = pydantic.Field(default=None, alias="Datetime")
     vehicle_name: Optional[str] = pydantic.Field(default=None, alias="Vehicle_Name")
     vehicle_no: Optional[str] = pydantic.Field(default=None, alias="Vehicle_No")
     vehicle_type: Optional[str] = pydantic.Field(default=None, alias="Vehicletype")
@@ -93,41 +118,40 @@ class TrackitVehicle(pydantic.BaseModel):
             for k, v in values.items()
         }
 
-    @pydantic.validator("gps_actual_time", "device_datetime", pre=True)
+    @pydantic.validator("gps_actual_time", pre=True)
     def _parse_trackit_datetime(cls, v):
         if v is None or isinstance(v, datetime):
             return v
-        return datetime.strptime(v, GPS_TIME_FORMAT)
-
-
-class TrackitLiveDataResponse(pydantic.BaseModel):
-    vehicle_data: List[TrackitVehicle] = pydantic.Field(default_factory=list, alias="VehicleData")
-
-    class Config:
-        allow_population_by_field_name = True
+        try:
+            return datetime.strptime(v, GPS_TIME_FORMAT)
+        except (ValueError, TypeError):
+            # A device that never got a fix can report a malformed time; treat
+            # it as missing so the handler skips it rather than failing the row.
+            logger.warning(f"Unparseable GPSActualTime '{v}'; treating as missing")
+            return None
 
 
 async def get_token(base_url: str, username: str, password: pydantic.SecretStr) -> str:
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
-        try:
-            response = await session.post(
-                base_url,
-                params={"token": "generateAccessToken"},
-                json={"username": username, "password": password.get_secret_value()},
-            )
-            if response.is_error:
-                logger.error(f"Error in 'get_token' endpoint. Response body: {response.text}")
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            handle_httpx_error(e)
+        parsed_response = await _post(
+            session,
+            base_url,
+            "generateAccessToken",
+            json={"username": username, "password": password.get_secret_value()},
+        )
 
-        parsed_response = response.json()
-        token = (parsed_response.get("data") or {}).get("token")
-        if parsed_response.get("result") != 1 or not token:
-            raise TrackitUnauthorizedException(
-                f"Login failed for username {username}. Response: {parsed_response.get('message') or response.text}"
-            )
-        return token
+    if not isinstance(parsed_response, dict):
+        raise TrackitBaseException(f"Unexpected login response from TrackIt: {parsed_response}")
+
+    token = (parsed_response.get("data") or {}).get("token")
+    # The API stringifies numerics elsewhere in its payloads, so accept "1" as
+    # well as 1 for the result flag and trust a present token over the flag.
+    result_ok = str(parsed_response.get("result")).strip() == "1"
+    if not token or not result_ok:
+        raise TrackitUnauthorizedException(
+            f"Login failed for username {username}. Response: {parsed_response.get('message') or parsed_response}"
+        )
+    return token
 
 
 async def get_live_data(
@@ -137,29 +161,34 @@ async def get_live_data(
         company_names: str,
         imei_nos: Optional[str] = None,
 ) -> List[TrackitVehicle]:
+    body = {"company_names": company_names, "format": "json"}
+    if imei_nos:
+        body["imei_nos"] = imei_nos
+
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
-        body = {"company_names": company_names, "format": "json"}
-        if imei_nos:
-            body["imei_nos"] = imei_nos
+        parsed_response = await _post(
+            session,
+            base_url,
+            "getTokenBaseLiveData",
+            params={"ProjectId": project_id},
+            headers={"auth-code": token},
+            json=body,
+        )
 
+    if not isinstance(parsed_response, dict) or "root" not in parsed_response:
+        message = parsed_response.get("message") if isinstance(parsed_response, dict) else str(parsed_response)
+        if message and "no company found" in str(message).lower():
+            raise TrackitNotFoundException(f"No Company Found for company_names '{company_names}'")
+        raise TrackitBaseException(f"Unexpected response from TrackIt live data endpoint: {parsed_response}")
+
+    raw_vehicles = (parsed_response.get("root") or {}).get("VehicleData") or []
+
+    # Parse each vehicle independently so one malformed row (e.g. a null IMEI or
+    # an unparseable field) is skipped rather than aborting the whole pull.
+    vehicles = []
+    for raw in raw_vehicles:
         try:
-            response = await session.post(
-                base_url,
-                params={"token": "getTokenBaseLiveData", "ProjectId": project_id},
-                headers={"auth-code": token},
-                json=body,
-            )
-            if response.is_error:
-                logger.error(f"Error in 'get_live_data' endpoint. Response body: {response.text}")
-            response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            handle_httpx_error(e)
-
-        parsed_response = response.json()
-        if not isinstance(parsed_response, dict) or "root" not in parsed_response:
-            message = parsed_response.get("message") if isinstance(parsed_response, dict) else str(parsed_response)
-            if message and "no company found" in str(message).lower():
-                raise TrackitNotFoundException(f"No Company Found for company_names '{company_names}'")
-            raise TrackitBaseException(f"Unexpected response from TrackIt live data endpoint: {response.text}")
-
-        return TrackitLiveDataResponse.parse_obj(parsed_response.get("root") or {}).vehicle_data
+            vehicles.append(TrackitVehicle.parse_obj(raw))
+        except pydantic.ValidationError as e:
+            logger.warning(f"Skipping malformed vehicle row (imei={raw.get('Imeino')!r}): {e}")
+    return vehicles

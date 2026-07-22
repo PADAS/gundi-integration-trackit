@@ -7,7 +7,13 @@ from typing import Optional
 
 from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
 from app.services.errors import ConfigurationNotFound
-from app.services.utils import find_config_for_action, FieldWithUIOptions, UIOptions, GlobalUISchemaOptions
+from app.services.utils import (
+    find_config_for_action,
+    FieldWithUIOptions,
+    UIOptions,
+    GlobalUISchemaOptions,
+    OptionalStringType,
+)
 
 
 UTC_OFFSET_REGEX = re.compile(r"^(?:UTC\s*)?([+-]?)(\d{1,2})(?::([0-5]\d))?$", re.IGNORECASE)
@@ -67,7 +73,7 @@ class PullObservationsConfig(PullActionConfiguration):
         title="Company Name",
         description="The TrackIt company to pull vehicle data for (a single company per integration)",
     )
-    imei_nos: Optional[str] = FieldWithUIOptions(
+    imei_nos: Optional[OptionalStringType] = FieldWithUIOptions(
         None,
         title="IMEI Numbers",
         description="Optional comma-separated list of device IMEIs to pull. Leave empty to pull all vehicles for the company.",
@@ -81,6 +87,7 @@ class PullObservationsConfig(PullActionConfiguration):
         "+2",
         title="GPS Timestamp UTC Offset",
         description="UTC offset (in hours) of the timestamps reported by the TrackIt platform. Examples: 0, -2, +3, +5:30",
+        regex=UTC_OFFSET_REGEX.pattern,
     )
 
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
@@ -114,16 +121,3 @@ def get_auth_config(integration):
             f"are missing. Please fix the integration setup in the portal."
         )
     return AuthenticateConfig.parse_obj(auth_config.data)
-
-
-def get_pull_config(integration):
-    pull_config = find_config_for_action(
-        configurations=integration.configurations,
-        action_id="pull_observations"
-    )
-    if not pull_config:
-        raise ConfigurationNotFound(
-            f"Pull Observations settings for integration {str(integration.id)} "
-            f"are missing. Please fix the integration setup in the portal."
-        )
-    return PullObservationsConfig.parse_obj(pull_config.data)

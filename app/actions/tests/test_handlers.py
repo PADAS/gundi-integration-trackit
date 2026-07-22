@@ -1,3 +1,4 @@
+import httpx
 import pytest
 import pydantic
 
@@ -89,18 +90,32 @@ def test_pull_config_rejects_invalid_offset():
 
 
 def test_transform():
-    observation = handlers.transform(VEHICLE, utc_offset_to_tzinfo("+2"))
+    recorded_at = datetime(2026, 7, 21, 7, 31, 31, tzinfo=timezone.utc)
+    observation = handlers.transform(VEHICLE, recorded_at)
 
     assert observation["source"] == "353742376164273"
     assert observation["source_name"] == "AFO 1285"
     assert observation["type"] == "tracking-device"
     assert observation["subject_type"] == "vehicle"
-    # 09:31:31 CAT (UTC+2) -> 07:31:31 UTC
-    assert observation["recorded_at"] == datetime(2026, 7, 21, 7, 31, 31, tzinfo=timezone.utc)
+    assert observation["recorded_at"] == recorded_at
     assert observation["location"] == {"lat": -17.8103899, "lon": 31.08255}
     assert observation["additional"]["vehicle_no"] == "AFO 1285"
     assert observation["additional"]["speed"] == 0
     assert "gps_actual_time" not in observation["additional"]
+
+
+def test_has_valid_position():
+    assert handlers.has_valid_position(VEHICLE) is True
+    assert handlers.has_valid_position(VEHICLE.copy(update={"latitude": None})) is False
+    assert handlers.has_valid_position(VEHICLE.copy(update={"gps_actual_time": None})) is False
+    # null island (0, 0)
+    assert handlers.has_valid_position(VEHICLE.copy(update={"latitude": 0.0, "longitude": 0.0})) is False
+
+
+def test_parse_watermark_handles_naive_and_aware():
+    assert handlers.parse_watermark("2026-07-21T09:31:31") == datetime(2026, 7, 21, 9, 31, 31)
+    # aware values written by an earlier version are coerced to naive
+    assert handlers.parse_watermark("2026-07-21T09:31:31+00:00") == datetime(2026, 7, 21, 9, 31, 31)
 
 
 @pytest.mark.asyncio
@@ -132,6 +147,34 @@ async def test_action_auth_bad_credentials(mocker, mock_integration, auth_config
 
 
 @pytest.mark.asyncio
+async def test_action_auth_not_found_returns_result_dict(mocker, mock_integration, auth_config):
+    mocker.patch(
+        "app.actions.client.get_token",
+        new_callable=AsyncMock,
+        side_effect=client.TrackitNotFoundException("Not found"),
+    )
+
+    result = await handlers.action_auth(mock_integration, auth_config)
+
+    assert result["valid_credentials"] is False
+    assert result["status_code"] == 404
+
+
+@pytest.mark.asyncio
+async def test_action_auth_transport_error_returns_result_dict(mocker, mock_integration, auth_config):
+    mocker.patch(
+        "app.actions.client.get_token",
+        new_callable=AsyncMock,
+        side_effect=httpx.ConnectError("name resolution failed"),
+    )
+
+    result = await handlers.action_auth(mock_integration, auth_config)
+
+    assert result["valid_credentials"] is False
+    assert "Could not reach TrackIt" in result["message"]
+
+
+@pytest.mark.asyncio
 async def test_action_pull_observations(mock_integration, pull_config, mock_pull_dependencies):
     result = await handlers.action_pull_observations(mock_integration, pull_config)
 
@@ -143,26 +186,42 @@ async def test_action_pull_observations(mock_integration, pull_config, mock_pull
         imei_nos="353742376164273",
     )
     mock_pull_dependencies["send_observations"].assert_awaited_once()
+    # Watermark is the raw (naive) device timestamp, independent of the offset.
     mock_pull_dependencies["set_state"].assert_awaited_once_with(
         integration_id="integration_id",
         action_id="pull_observations",
-        state={"latest_gps_time": "2026-07-21T07:31:31+00:00"},
+        state={"latest_gps_time": "2026-07-21T09:31:31"},
         source_id="353742376164273",
     )
-    assert result == {"observations_extracted": 1}
+    assert result == {"observations_extracted": 1, "vehicles_skipped": 0}
 
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_skips_already_sent_positions(
         mock_integration, pull_config, mock_pull_dependencies
 ):
-    mock_pull_dependencies["get_state"].return_value = {"latest_gps_time": "2026-07-21T07:31:31+00:00"}
+    mock_pull_dependencies["get_state"].return_value = {"latest_gps_time": "2026-07-21T09:31:31"}
 
     result = await handlers.action_pull_observations(mock_integration, pull_config)
 
     mock_pull_dependencies["send_observations"].assert_not_awaited()
     mock_pull_dependencies["set_state"].assert_not_awaited()
-    assert result == {"observations_extracted": 0}
+    assert result == {"observations_extracted": 0, "vehicles_skipped": 0}
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_dedup_is_offset_independent(
+        mocker, mock_integration, mock_pull_dependencies
+):
+    # Watermark stored while running at +2; operator later switches to 0.
+    mock_pull_dependencies["get_state"].return_value = {"latest_gps_time": "2026-07-21T09:31:31"}
+    config = PullObservationsConfig(company_names="Chewore", gps_utc_offset="0")
+
+    result = await handlers.action_pull_observations(mock_integration, config)
+
+    # Same raw device time as the watermark -> still deduped despite the offset change.
+    mock_pull_dependencies["send_observations"].assert_not_awaited()
+    assert result["observations_extracted"] == 0
 
 
 @pytest.mark.asyncio
@@ -175,4 +234,42 @@ async def test_action_pull_observations_skips_vehicles_without_position(
     result = await handlers.action_pull_observations(mock_integration, pull_config)
 
     mock_pull_dependencies["send_observations"].assert_not_awaited()
-    assert result == {"observations_extracted": 0}
+    assert result == {"observations_extracted": 0, "vehicles_skipped": 1}
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_skips_future_timestamps(
+        mock_integration, pull_config, mock_pull_dependencies
+):
+    future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=3)
+    future_vehicle = VEHICLE.copy(update={"gps_actual_time": future})
+    mock_pull_dependencies["get_live_data"].return_value = [future_vehicle]
+
+    result = await handlers.action_pull_observations(mock_integration, pull_config)
+
+    mock_pull_dependencies["send_observations"].assert_not_awaited()
+    mock_pull_dependencies["set_state"].assert_not_awaited()
+    assert result == {"observations_extracted": 0, "vehicles_skipped": 1}
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_saves_state_per_batch(
+        mocker, mock_integration, pull_config, mock_pull_dependencies
+):
+    # Two vehicles, batch size 1 -> two batches. Second send fails; the first
+    # batch's watermark must already be persisted so it is not re-sent next run.
+    vehicle_b = VEHICLE.copy(update={"imei": "999", "gps_actual_time": datetime(2026, 7, 21, 10, 0, 0)})
+    mock_pull_dependencies["get_live_data"].return_value = [VEHICLE, vehicle_b]
+    mocker.patch("app.actions.handlers.OBSERVATIONS_BATCH_SIZE", 1)
+    mock_pull_dependencies["send_observations"].side_effect = [["ok"], httpx.HTTPError("boom")]
+
+    with pytest.raises(httpx.HTTPError):
+        await handlers.action_pull_observations(mock_integration, pull_config)
+
+    # State saved for the first (delivered) batch only.
+    mock_pull_dependencies["set_state"].assert_awaited_once_with(
+        integration_id="integration_id",
+        action_id="pull_observations",
+        state={"latest_gps_time": "2026-07-21T09:31:31"},
+        source_id="353742376164273",
+    )

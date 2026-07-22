@@ -88,6 +88,30 @@ async def test_get_token_server_error():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_get_token_accepts_stringified_result():
+    # The API stringifies numerics elsewhere; "1" must still count as success.
+    respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(
+        json={"result": "1", "data": {"token": "token123"}, "message": ""}
+    )
+
+    token = await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("secret"))
+
+    assert token == "token123"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_token_non_json_body_raises_trackit_error():
+    respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(
+        status_code=200, text="<html>Invalid Request</html>"
+    )
+
+    with pytest.raises(TrackitBaseException):
+        await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("secret"))
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_get_live_data_success():
     route = respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
         json={"root": {"VehicleData": [VEHICLE_DATA]}}
@@ -157,9 +181,33 @@ async def test_get_live_data_unauthorized():
         await get_live_data(BASE_URL, "bad-token", 37, "Chewore")
 
 
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_live_data_skips_malformed_rows():
+    good = VEHICLE_DATA
+    bad_missing_imei = {**VEHICLE_DATA, "Imeino": "--"}  # required field normalized to None
+    respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
+        json={"root": {"VehicleData": [good, bad_missing_imei]}}
+    )
+
+    vehicles = await get_live_data(BASE_URL, "token123", 37, "Chewore")
+
+    # The malformed row is dropped; the good one still comes through.
+    assert len(vehicles) == 1
+    assert vehicles[0].imei == "353742376164273"
+
+
 def test_vehicle_model_handles_missing_position():
     vehicle = TrackitVehicle.parse_obj({**VEHICLE_DATA, "Latitude": "--", "Longitude": "", "GPSActualTime": "NA"})
 
     assert vehicle.latitude is None
     assert vehicle.longitude is None
     assert vehicle.gps_actual_time is None
+
+
+def test_vehicle_model_tolerates_unparseable_gps_time():
+    vehicle = TrackitVehicle.parse_obj({**VEHICLE_DATA, "GPSActualTime": "21-07-2026 09:31"})
+
+    # Unparseable time becomes None rather than raising and dropping the row.
+    assert vehicle.gps_actual_time is None
+    assert vehicle.imei == "353742376164273"
