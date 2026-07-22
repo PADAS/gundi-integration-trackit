@@ -1,0 +1,165 @@
+import httpx
+import pytest
+import pydantic
+import respx
+
+from datetime import datetime
+
+from app.actions.client import (
+    get_token,
+    get_live_data,
+    TrackitBaseException,
+    TrackitNotFoundException,
+    TrackitUnauthorizedException,
+    TrackitInternalServerException,
+    TrackitVehicle,
+)
+
+
+BASE_URL = "https://genx.trackit.co.zw/webservice"
+
+VEHICLE_DATA = {
+    "Company": "Chewore",
+    "heartbeat": "no",
+    "Latitude": "-17.8103899",
+    "GPS": "ON",
+    "Status": "STOP",
+    "DeviceModel": "FMB920",
+    "AC": "--",
+    "gps_hdop": "NA",
+    "Odometer": "59730724",
+    "POI": "At 24 Princess Drive",
+    "Longitude": "31.08255",
+    "satellite_count": 18,
+    "ExternalVolt": "--",
+    "Vehicle_Name": "AFO 1285",
+    "Vehicle_No": "AFO 1285",
+    "Branch": "Chewore",
+    "Vehicletype": "Car",
+    "course": "",
+    "GPSActualTime": "21-07-2026 09:31:31",
+    "Datetime": "21-07-2026 09:31:38",
+    "Speed": "0",
+    "Imeino": "353742376164273",
+    "IGN": "OFF",
+    "Angle": "76",
+    "Fuel": [],
+    "Vin": "--",
+    "battery_percentage": "0",
+    "Power": "--",
+    "username": "user@test.org",
+    "Location": "At 24 Princess Drive",
+    "Altitude": "1492",
+}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_token_success():
+    route = respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(
+        json={"result": 1, "data": {"token": "token123"}, "message": ""}
+    )
+
+    token = await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("secret"))
+
+    assert route.called
+    assert token == "token123"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_token_bad_credentials():
+    respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(
+        json={"result": 0, "data": {}, "message": "Invalid username or password"}
+    )
+
+    with pytest.raises(TrackitUnauthorizedException):
+        await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("bad"))
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_token_server_error():
+    respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(status_code=500)
+
+    with pytest.raises(TrackitInternalServerException):
+        await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("secret"))
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_live_data_success():
+    route = respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
+        json={"root": {"VehicleData": [VEHICLE_DATA]}}
+    )
+
+    vehicles = await get_live_data(BASE_URL, "token123", 37, "Chewore", "353742376164273")
+
+    assert route.called
+    request = route.calls.last.request
+    assert request.headers["auth-code"] == "token123"
+
+    assert len(vehicles) == 1
+    vehicle = vehicles[0]
+    assert vehicle.imei == "353742376164273"
+    assert vehicle.latitude == -17.8103899
+    assert vehicle.longitude == 31.08255
+    assert vehicle.gps_actual_time == datetime(2026, 7, 21, 9, 31, 31)
+    assert vehicle.vehicle_name == "AFO 1285"
+    assert vehicle.speed == 0
+    # "--" and "" placeholders normalized to None
+    assert vehicle.power is None
+    assert vehicle.external_volt is None
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_live_data_omits_imei_nos_when_not_given():
+    route = respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 49}).respond(
+        json={"root": {"VehicleData": []}}
+    )
+
+    vehicles = await get_live_data(BASE_URL, "token123", 49, "Chewore")
+
+    assert route.called
+    assert b"imei_nos" not in route.calls.last.request.content
+    assert vehicles == []
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_live_data_no_company_found():
+    respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
+        json={"result": 0, "message": "No Company Found"}
+    )
+
+    with pytest.raises(TrackitNotFoundException):
+        await get_live_data(BASE_URL, "token123", 37, "Unknown Company")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_live_data_unexpected_response():
+    respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
+        json={"result": 0, "message": "Something else"}
+    )
+
+    with pytest.raises(TrackitBaseException):
+        await get_live_data(BASE_URL, "token123", 37, "Chewore")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_get_live_data_unauthorized():
+    respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(status_code=401)
+
+    with pytest.raises(TrackitUnauthorizedException):
+        await get_live_data(BASE_URL, "bad-token", 37, "Chewore")
+
+
+def test_vehicle_model_handles_missing_position():
+    vehicle = TrackitVehicle.parse_obj({**VEHICLE_DATA, "Latitude": "--", "Longitude": "", "GPSActualTime": "NA"})
+
+    assert vehicle.latitude is None
+    assert vehicle.longitude is None
+    assert vehicle.gps_actual_time is None
