@@ -1,11 +1,30 @@
+import re
+
 import pydantic
 
+from datetime import timedelta, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
 from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action, FieldWithUIOptions, UIOptions, GlobalUISchemaOptions
+
+
+UTC_OFFSET_REGEX = re.compile(r"^(?:UTC\s*)?([+-]?)(\d{1,2})(?::([0-5]\d))?$", re.IGNORECASE)
+
+
+def utc_offset_to_tzinfo(offset: str) -> timezone:
+    """Convert a UTC offset string ('0', '-2', '+3', '+5:30', 'UTC+2') to a tzinfo."""
+    match = UTC_OFFSET_REGEX.match(str(offset).strip())
+    if not match:
+        raise ValueError(f"'{offset}' is not a valid UTC offset. Examples: 0, -2, +3, +5:30")
+    sign, hours, minutes = match.groups()
+    delta = timedelta(hours=int(hours), minutes=int(minutes or 0))
+    if sign == "-":
+        delta = -delta
+    if not timedelta(hours=-12) <= delta <= timedelta(hours=14):
+        raise ValueError(f"UTC offset '{offset}' is out of range (UTC-12 to UTC+14)")
+    return timezone(delta)
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -58,10 +77,10 @@ class PullObservationsConfig(PullActionConfiguration):
         title="Project ID",
         description="The TrackIt project ID (37 = Premium, 49 = Standard)",
     )
-    device_timezone: str = FieldWithUIOptions(
-        "Africa/Harare",
-        title="Device Timezone",
-        description="IANA timezone name in which the TrackIt platform reports GPS timestamps (e.g. 'Africa/Harare')",
+    gps_utc_offset: str = FieldWithUIOptions(
+        "+2",
+        title="GPS Timestamp UTC Offset",
+        description="UTC offset (in hours) of the timestamps reported by the TrackIt platform. Examples: 0, -2, +3, +5:30",
     )
 
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
@@ -69,7 +88,7 @@ class PullObservationsConfig(PullActionConfiguration):
             "company_names",
             "imei_nos",
             "project_id",
-            "device_timezone",
+            "gps_utc_offset",
             "run_on_schedule",
         ],
     )
@@ -77,12 +96,9 @@ class PullObservationsConfig(PullActionConfiguration):
     class Config:
         title = "Pull Observations"
 
-    @pydantic.validator("device_timezone")
-    def _validate_timezone(cls, v):
-        try:
-            ZoneInfo(v)
-        except Exception:
-            raise ValueError(f"'{v}' is not a valid IANA timezone name")
+    @pydantic.validator("gps_utc_offset")
+    def _validate_utc_offset(cls, v):
+        utc_offset_to_tzinfo(v)
         return v
 
 

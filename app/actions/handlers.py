@@ -1,7 +1,6 @@
 import logging
 
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -11,6 +10,7 @@ from app.actions.configurations import (
     AuthenticateConfig,
     PullObservationsConfig,
     get_auth_config,
+    utc_offset_to_tzinfo,
 )
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
@@ -27,7 +27,7 @@ TRACKIT_BASE_URL = "https://genx.trackit.co.zw/webservice"
 OBSERVATIONS_BATCH_SIZE = 200
 
 
-def transform(vehicle: client.TrackitVehicle, device_tz: ZoneInfo) -> dict:
+def transform(vehicle: client.TrackitVehicle, device_tz: timezone) -> dict:
     recorded_at = vehicle.gps_actual_time.replace(tzinfo=device_tz).astimezone(timezone.utc)
     additional = vehicle.dict(
         exclude_none=True,
@@ -72,7 +72,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     base_url = integration.base_url or TRACKIT_BASE_URL
     auth_config = get_auth_config(integration)
-    device_tz = ZoneInfo(action_config.device_timezone)
+    device_tz = utc_offset_to_tzinfo(action_config.gps_utc_offset)
 
     token = await client.get_token(base_url, auth_config.username, auth_config.password)
     vehicles = await client.get_live_data(

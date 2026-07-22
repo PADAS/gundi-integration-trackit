@@ -2,13 +2,12 @@ import pytest
 import pydantic
 
 from unittest.mock import AsyncMock, MagicMock
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 import app.actions.handlers as handlers
 import app.actions.client as client
 
-from app.actions.configurations import AuthenticateConfig, PullObservationsConfig
+from app.actions.configurations import AuthenticateConfig, PullObservationsConfig, utc_offset_to_tzinfo
 
 
 VEHICLE = client.TrackitVehicle(
@@ -72,8 +71,25 @@ def mock_pull_dependencies(mocker, auth_config):
     return mocks
 
 
+def test_utc_offset_to_tzinfo():
+    assert utc_offset_to_tzinfo("+2") == timezone(timedelta(hours=2))
+    assert utc_offset_to_tzinfo("2") == timezone(timedelta(hours=2))
+    assert utc_offset_to_tzinfo("0") == timezone.utc
+    assert utc_offset_to_tzinfo("-3:30") == timezone(timedelta(hours=-3, minutes=-30))
+    assert utc_offset_to_tzinfo("+5:30") == timezone(timedelta(hours=5, minutes=30))
+    assert utc_offset_to_tzinfo("UTC+2") == timezone(timedelta(hours=2))
+    for invalid in ["abc", "+15", "-13", "+2:75", ""]:
+        with pytest.raises(ValueError):
+            utc_offset_to_tzinfo(invalid)
+
+
+def test_pull_config_rejects_invalid_offset():
+    with pytest.raises(pydantic.ValidationError):
+        PullObservationsConfig(company_names="Chewore", gps_utc_offset="whatever")
+
+
 def test_transform():
-    observation = handlers.transform(VEHICLE, ZoneInfo("Africa/Harare"))
+    observation = handlers.transform(VEHICLE, utc_offset_to_tzinfo("+2"))
 
     assert observation["source"] == "353742376164273"
     assert observation["source_name"] == "AFO 1285"
