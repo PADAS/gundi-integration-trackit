@@ -88,6 +88,17 @@ async def test_get_token_server_error():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_get_token_unexpected_4xx_maps_to_trackit_error():
+    respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(status_code=429)
+
+    with pytest.raises(TrackitBaseException) as exc_info:
+        await get_token(BASE_URL, "user@test.org", pydantic.SecretStr("secret"))
+
+    assert exc_info.value.status_code == 429
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_get_token_accepts_stringified_result():
     # The API stringifies numerics elsewhere; "1" must still count as success.
     respx.post(BASE_URL, params={"token": "generateAccessToken"}).respond(

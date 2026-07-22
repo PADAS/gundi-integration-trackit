@@ -50,7 +50,9 @@ def handle_httpx_error(e: httpx.HTTPStatusError):
         raise TrackitNotFoundException("Not found", e) from e
     if status >= 500:
         raise TrackitInternalServerException("Internal server error at TrackIt", e, status_code=status) from e
-    raise e
+    # Any other status (400/422/429/...) still means TrackIt was reached and
+    # answered — surface it as an API error, not a transport failure.
+    raise TrackitBaseException(f"TrackIt returned HTTP {status}", e, status_code=status) from e
 
 
 async def _post(session, base_url, endpoint, *, params=None, headers=None, json=None) -> dict:
@@ -145,7 +147,8 @@ async def get_token(base_url: str, username: str, password: pydantic.SecretStr) 
 
     token = (parsed_response.get("data") or {}).get("token")
     # The API stringifies numerics elsewhere in its payloads, so accept "1" as
-    # well as 1 for the result flag and trust a present token over the flag.
+    # well as 1 for the result flag. Both a token and a success flag are
+    # required — a token alongside result != 1 is treated as a failed login.
     result_ok = str(parsed_response.get("result")).strip() == "1"
     if not token or not result_ok:
         raise TrackitUnauthorizedException(
