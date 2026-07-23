@@ -79,11 +79,12 @@ async def _handle_error(
     # third-party provider one, and must not render as "Authentication
     # failed" (which would misdirect operators at the provider).
     classified = classify_error(exc) if (classify_heuristics or isinstance(exc, IntegrationError)) else None
-    if classified:
-        message = format_classified_error(classified)
-    else:
-        message = f"Error in action '{action_id}' for integration '{integration_id}': {type(exc).__name__}: {exc}"
-    logger.exception(message)
+    log_message = f"Error in action '{action_id}' for integration '{integration_id}': {type(exc).__name__}: {exc}"
+    message = format_classified_error(classified) if classified else log_message
+    # The application log always keeps the verbose form — the action and
+    # integration ids are what server-side log searches key on; the clean
+    # text is only for the portal-facing event and JSON response.
+    logger.exception(log_message)
 
     error_details = {
         "integration_id": integration_id,
