@@ -12,6 +12,8 @@ from app import settings
 from app.conftest import MockSubActionConfiguration, MockPushActionConfiguration, async_return
 from app.main import app
 from app.services.action_scheduler import trigger_action
+from app.services.action_runner import execute_action
+from app.services.errors import IntegrationAuthError
 
 api_client = TestClient(app)
 
@@ -611,3 +613,57 @@ async def test_push_data_acks_message_without_destination_id(
     assert response.status_code == 200
     assert response.json() == {}
     assert not mock_execute_action.called
+
+
+@pytest.mark.asyncio
+async def test_execute_action_reports_classified_auth_error_with_clean_text(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    mock_handler, _, _ = mock_action_handlers["pull_observations"]
+    mock_handler.side_effect = IntegrationAuthError("TrackIt rejected the credentials", status_code=401)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    )
+
+    expected_text = "Authentication failed — TrackIt rejected the credentials (HTTP 401)"
+    failed_events = _published_events_of_type(mock_publish_event, IntegrationActionFailed)
+    assert len(failed_events) >= 1
+    for event in failed_events:
+        assert event.payload.error == expected_text
+    error_details = json.loads(response.body)["detail"]
+    assert error_details["error"] == expected_text
+    assert error_details["error_type"] == "auth"
+
+
+@pytest.mark.asyncio
+async def test_execute_action_keeps_generic_format_for_unclassified_errors(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    mock_handler, _, _ = mock_action_handlers["pull_observations"]
+    mock_handler.side_effect = ValueError("something unexpected")
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    )
+
+    error_details = json.loads(response.body)["detail"]
+    assert error_details["error"] == (
+        f"Error in action 'pull_observations' for integration '{str(integration_v2.id)}': "
+        f"ValueError: something unexpected"
+    )
+    assert error_details["error_type"] is None

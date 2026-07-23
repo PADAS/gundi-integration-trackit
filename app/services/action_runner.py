@@ -20,6 +20,7 @@ from app.actions.core import PullActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .activity_logger import publish_event, log_action_activity
+from .errors import classify_error, format_classified_error
 
 _portal = GundiClient()
 config_manager = IntegrationConfigurationManager()
@@ -62,7 +63,16 @@ async def _handle_error(
     Returns a JSON response with error details too.
     """
 
-    message = f"Error in action '{action_id}' for integration '{integration_id}': {type(exc).__name__}: {exc}"
+    # Classified errors (auth, connectivity, rate limit, bad response) get
+    # short human-first text — the portal prepends "Error running action
+    # '<id>': " and truncates, so the useful part must come first. Anything
+    # unclassified keeps the verbose format. Full details always remain in
+    # error_traceback and the request/response fields below.
+    classified = classify_error(exc)
+    if classified:
+        message = format_classified_error(classified)
+    else:
+        message = f"Error in action '{action_id}' for integration '{integration_id}': {type(exc).__name__}: {exc}"
     logger.exception(message)
 
     error_details = {
@@ -70,6 +80,9 @@ async def _handle_error(
         "action_id": action_id,
         "config_data": config_data or {},
         "error": message,
+        # Machine-readable category. Only reaches the JSON response below;
+        # ActionExecutionFailed is a gundi-core model that drops unknown fields.
+        "error_type": classified.error_type if classified else None,
         "error_traceback": traceback.format_exc()
     }
 
