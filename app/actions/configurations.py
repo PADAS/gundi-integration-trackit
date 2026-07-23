@@ -3,7 +3,6 @@ import re
 import pydantic
 
 from datetime import timedelta, timezone
-from typing import Optional
 
 from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
 from app.services.errors import ConfigurationNotFound
@@ -16,11 +15,15 @@ from app.services.utils import (
 )
 
 
-# Hours limited to 0-14 so the portal-side pattern rejects out-of-range
-# offsets at save time, matching the range check in utc_offset_to_tzinfo.
+# Per-sign hour bounds (UTC-12 to UTC+14) are encoded in the pattern itself so
+# the portal (ajv) rejects out-of-range hours client-side. The validator below
+# is still authoritative for the exact range, catching the minute-level edges
+# the pattern can't express (e.g. +14:30, -12:30).
 # Case-sensitive on purpose: the JSON-schema `pattern` keyword (ajv) doesn't
 # carry regex flags, so the backend must accept exactly what the portal does.
-UTC_OFFSET_REGEX = re.compile(r"^(?:UTC\s*)?([+-]?)(1[0-4]|0?\d)(?::([0-5]\d))?$")
+# Groups: (positive hours, negative hours, minutes) — exactly one hour group
+# matches per input.
+UTC_OFFSET_REGEX = re.compile(r"^(?:UTC\s*)?(?:\+?(1[0-4]|0?\d)|-(1[0-2]|0?\d))(?::([0-5]\d))?$")
 
 
 def utc_offset_to_tzinfo(offset: str) -> timezone:
@@ -28,10 +31,12 @@ def utc_offset_to_tzinfo(offset: str) -> timezone:
     match = UTC_OFFSET_REGEX.match(str(offset).strip())
     if not match:
         raise ValueError(f"'{offset}' is not a valid UTC offset. Examples: 0, -2, +3, +5:30")
-    sign, hours, minutes = match.groups()
-    delta = timedelta(hours=int(hours), minutes=int(minutes or 0))
-    if sign == "-":
-        delta = -delta
+    pos_hours, neg_hours, minutes = match.groups()
+    minutes = int(minutes or 0)
+    if neg_hours is not None:
+        delta = -timedelta(hours=int(neg_hours), minutes=minutes)
+    else:
+        delta = timedelta(hours=int(pos_hours), minutes=minutes)
     if not timedelta(hours=-12) <= delta <= timedelta(hours=14):
         raise ValueError(f"UTC offset '{offset}' is out of range (UTC-12 to UTC+14)")
     return timezone(delta)
@@ -77,7 +82,7 @@ class PullObservationsConfig(PullActionConfiguration):
         title="Company Name",
         description="The TrackIt company to pull vehicle data for (a single company per integration)",
     )
-    imei_nos: Optional[OptionalStringType] = FieldWithUIOptions(
+    imei_nos: OptionalStringType = FieldWithUIOptions(
         None,
         title="IMEI Numbers",
         description="Optional comma-separated list of device IMEIs to pull. Leave empty to pull all vehicles for the company.",
@@ -85,7 +90,7 @@ class PullObservationsConfig(PullActionConfiguration):
     project_id: int = FieldWithUIOptions(
         37,
         title="Project ID",
-        description="The TrackIt project ID (37 = Premium, 49 = Standard)",
+        description="The TrackIt project ID, which selects the Trakzee application tier (37 = Premium, 49 = Standard).",
     )
     gps_utc_offset: str = FieldWithUIOptions(
         "+2",

@@ -2,7 +2,7 @@ import httpx
 import pytest
 import pydantic
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 from datetime import datetime, timedelta, timezone
 
 import app.actions.handlers as handlers
@@ -181,6 +181,7 @@ async def test_action_pull_observations(mock_integration, pull_config, mock_pull
         project_id=37,
         company_names="Chewore",
         imei_nos="353742376164273",
+        session=ANY,
     )
     mock_pull_dependencies["send_observations"].assert_awaited_once()
     # Watermark is the raw (naive) device timestamp, independent of the offset.

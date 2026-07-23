@@ -14,6 +14,7 @@ from app.actions.configurations import (
     get_auth_config,
     utc_offset_to_tzinfo,
 )
+from app.actions.core import action_title
 from app.services.action_scheduler import crontab_schedule
 from app.services.activity_logger import activity_logger
 from app.services.gundi import send_observations_to_gundi
@@ -102,6 +103,7 @@ def transform(vehicle: client.TrackitVehicle, recorded_at: datetime) -> dict:
     }
 
 
+@action_title("Authentication")
 async def action_auth(integration, action_config: AuthenticateConfig):
     logger.info(f"Executing 'auth' action with integration ID {integration.id}...")
     base_url = integration.base_url or TRACKIT_BASE_URL
@@ -120,6 +122,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     return {"valid_credentials": True}
 
 
+@action_title("Connection Settings")
 @crontab_schedule("*/10 * * * *")
 @activity_logger()
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
@@ -131,14 +134,19 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     device_tz = utc_offset_to_tzinfo(action_config.gps_utc_offset)
     now = datetime.now(timezone.utc)
 
-    token = await client.get_token(base_url, auth_config.username, auth_config.password)
-    vehicles = await client.get_live_data(
-        base_url,
-        token,
-        project_id=action_config.project_id,
-        company_names=action_config.company_names,
-        imei_nos=action_config.imei_nos,
-    )
+    # Share one connection pool across the token + live-data calls (same host).
+    async with httpx.AsyncClient(timeout=client.DEFAULT_TIMEOUT) as session:
+        token = await client.get_token(
+            base_url, auth_config.username, auth_config.password, session=session
+        )
+        vehicles = await client.get_live_data(
+            base_url,
+            token,
+            project_id=action_config.project_id,
+            company_names=action_config.company_names,
+            imei_nos=action_config.imei_nos,
+            session=session,
+        )
     logger.info(f"-- Extracted {len(vehicles)} vehicles for integration ID: {integration_id} --")
 
     # Filter invalid rows and collapse duplicate IMEIs (a vehicle can appear

@@ -1,7 +1,8 @@
 import logging
 
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import AsyncIterator, List, NoReturn, Optional
 
 import httpx
 import pydantic
@@ -14,12 +15,30 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)
 GPS_TIME_FORMAT = "%d-%m-%Y %H:%M:%S"
 
+# Both endpoints only need retrying on transport-level failures; a mapped
+# TrackitBaseException means the server answered and retrying won't help.
+_retry_on_transport = stamina.retry(on=httpx.TransportError, attempts=3, wait_initial=1.0, wait_max=10.0)
+
+
+@asynccontextmanager
+async def _acquire_session(session: Optional[httpx.AsyncClient]) -> AsyncIterator[httpx.AsyncClient]:
+    """Yield a caller-supplied session as-is, or open (and close) a fresh one.
+
+    Lets the handler share a single connection pool across the token + live-data
+    calls, while standalone callers (e.g. the auth action) still work unchanged.
+    """
+    if session is not None:
+        yield session
+    else:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as own_session:
+            yield own_session
+
 # Placeholder values the TrackIt API uses for missing data
 EMPTY_VALUES = {"", "--", "NA"}
 
 
 class TrackitBaseException(Exception):
-    default_status_code: int = None
+    default_status_code: Optional[int] = None
 
     def __init__(self, message: str, error: Exception = None, status_code: int = None):
         self.status_code = status_code if status_code is not None else self.default_status_code
@@ -43,7 +62,7 @@ class TrackitInternalServerException(TrackitBaseException):
     default_status_code = 500
 
 
-def handle_httpx_error(e: httpx.HTTPStatusError):
+def handle_httpx_error(e: httpx.HTTPStatusError) -> NoReturn:
     status = e.response.status_code
     if status in (401, 403):
         raise TrackitUnauthorizedException("Unauthorized access", e, status_code=status) from e
@@ -135,9 +154,14 @@ class TrackitVehicle(pydantic.BaseModel):
             return None
 
 
-@stamina.retry(on=httpx.TransportError, attempts=3, wait_initial=1.0, wait_max=10.0)
-async def get_token(base_url: str, username: str, password: pydantic.SecretStr) -> str:
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
+@_retry_on_transport
+async def get_token(
+        base_url: str,
+        username: str,
+        password: pydantic.SecretStr,
+        session: Optional[httpx.AsyncClient] = None,
+) -> str:
+    async with _acquire_session(session) as session:
         parsed_response = await _post(
             session,
             base_url,
@@ -163,19 +187,20 @@ async def get_token(base_url: str, username: str, password: pydantic.SecretStr) 
     return token
 
 
-@stamina.retry(on=httpx.TransportError, attempts=3, wait_initial=1.0, wait_max=10.0)
+@_retry_on_transport
 async def get_live_data(
         base_url: str,
         token: str,
         project_id: int,
         company_names: str,
         imei_nos: Optional[str] = None,
+        session: Optional[httpx.AsyncClient] = None,
 ) -> List[TrackitVehicle]:
     body = {"company_names": company_names, "format": "json"}
     if imei_nos:
         body["imei_nos"] = imei_nos
 
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as session:
+    async with _acquire_session(session) as session:
         parsed_response = await _post(
             session,
             base_url,
