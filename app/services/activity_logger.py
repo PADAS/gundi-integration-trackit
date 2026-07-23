@@ -160,7 +160,7 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
                         ),
                         topic_name=settings.INTEGRATION_EVENTS_TOPIC,
                     )
-                raise e
+                raise
             else:
                 if on_completion:
                     await publish_event(
