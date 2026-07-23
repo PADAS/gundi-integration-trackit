@@ -12,6 +12,7 @@ from gundi_core.events import (
 )
 from app import settings
 from app.services.activity_logger import publish_event, activity_logger, webhook_activity_logger, log_activity
+from app.services.errors import IntegrationAuthError
 from app.webhooks import GenericJsonPayload, GenericJsonTransformConfig
 
 
@@ -217,9 +218,6 @@ async def test_log_activity_with_error_level(mocker, integration_v2, mock_publis
     )
     assert mock_publish_event.call_count == 1
     assert isinstance(mock_publish_event.call_args_list[0].kwargs.get("event"), IntegrationActionCustomLog)
-
-
-from app.services.errors import IntegrationAuthError
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 import base64
 import json
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from fastapi import status
@@ -666,4 +667,35 @@ async def test_execute_action_keeps_generic_format_for_unclassified_errors(
         f"Error in action 'pull_observations' for integration '{str(integration_v2.id)}': "
         f"ValueError: something unexpected"
     )
+    assert error_details["error_type"] is None
+
+
+@pytest.mark.asyncio
+async def test_execute_action_keeps_generic_format_for_integration_details_failure(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers,
+):
+    # Heuristic classification must NOT apply to failures fetching the
+    # integration details from the Gundi portal itself — a portal
+    # connectivity/auth problem must not be misreported as a third-party
+    # provider failure ("Could not reach the provider").
+    # request= is set to avoid tripping httpx's own "request not set" RuntimeError
+    # when _handle_error's getattr(exc, "request", None) touches the property below —
+    # unrelated to what this test is verifying.
+    mock_config_manager.get_integration_details.side_effect = httpx.ConnectError(
+        "connection failed", request=httpx.Request("GET", "https://example.com")
+    )
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    )
+
+    error_details = json.loads(response.body)["detail"]
+    assert error_details["error"].startswith("Error in action")
     assert error_details["error_type"] is None

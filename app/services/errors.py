@@ -96,16 +96,20 @@ def classify_error(exc: Exception) -> Optional[ClassifiedError]:
             status_code=getattr(exc, "status_code", None),
         )
 
-    # Use getattr (not truthiness): httpx error responses are falsy.
+    # getattr chain: non-HTTP exceptions have no .response attribute.
     status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    # httpx.HTTPStatusError from raise_for_status() stringifies to multi-line
+    # text (URL plus a "For more information check: ..." line) — only the
+    # first line is useful as a short, human-first message.
+    first_line = (str(exc).splitlines() or [""])[0]
     if status_code in (401, 403):
-        return ClassifiedError("auth", IntegrationAuthError.default_title, str(exc), status_code)
+        return ClassifiedError("auth", IntegrationAuthError.default_title, first_line, status_code)
     if status_code == 429:
-        return ClassifiedError("rate_limit", IntegrationRateLimitError.default_title, str(exc), status_code)
+        return ClassifiedError("rate_limit", IntegrationRateLimitError.default_title, first_line, status_code)
     if status_code is not None and status_code >= 500:
-        return ClassifiedError("bad_response", IntegrationBadResponseError.default_title, str(exc), status_code)
+        return ClassifiedError("bad_response", IntegrationBadResponseError.default_title, first_line, status_code)
     if isinstance(exc, CONNECTIVITY_EXCEPTIONS):
-        return ClassifiedError("connectivity", IntegrationConnectionError.default_title, str(exc), None)
+        return ClassifiedError("connectivity", IntegrationConnectionError.default_title, first_line, None)
     return None
 
 

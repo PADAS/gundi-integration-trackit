@@ -97,6 +97,22 @@ def test_classify_by_response_status_code(status_code, expected_type, expected_t
     assert classified.status_code == status_code
 
 
+def test_classify_uses_only_first_line_of_multiline_exception_message():
+    # Real httpx.HTTPStatusError from raise_for_status() stringifies to
+    # multi-line text (URL plus a "For more information check: ..." line);
+    # only the first line should end up in the classified message.
+    request = httpx.Request("GET", "https://x")
+    response = httpx.Response(500, request=request)
+    exc = httpx.HTTPStatusError(
+        "Server error '500' for url 'https://x'\nFor more information check: https://mozilla.org",
+        request=request, response=response,
+    )
+
+    classified = classify_error(exc)
+
+    assert classified.message == "Server error '500' for url 'https://x'"
+
+
 @pytest.mark.parametrize(
     "exc",
     [

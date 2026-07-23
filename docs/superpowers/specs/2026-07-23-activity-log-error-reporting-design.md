@@ -106,3 +106,4 @@ The machine-readable `error_type` string is included in the `error_details` dict
 | Surfacing | Clean error text within existing failure events (no CustomActivityLog duplicates) |
 | Classification | Explicit standard exceptions, with heuristic fallback for unadopted code |
 | Throttling | None — every failed run publishes its event |
+| Heuristic scope | Heuristics apply only to action-handler execution errors; explicit IntegrationError subclasses classify everywhere (decided at final review — portal/config-fetch failures must not render as provider failures) |

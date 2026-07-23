@@ -20,7 +20,7 @@ from app.actions.core import PullActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .activity_logger import publish_event, log_action_activity
-from .errors import classify_error, format_classified_error
+from .errors import classify_error, format_classified_error, IntegrationError
 
 _portal = GundiClient()
 config_manager = IntegrationConfigurationManager()
@@ -56,7 +56,8 @@ class ActionTrigger(str, Enum):
 
 async def _handle_error(
         exc: Exception, integration_id: str, action_id: Optional[str] = None,
-        config_data=None, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
+        config_data=None, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        *, classify_heuristics: bool = False
 ):
     """
     Handles errors by logging, extracting details as available, and publishing events for activity logs.
@@ -68,7 +69,16 @@ async def _handle_error(
     # '<id>': " and truncates, so the useful part must come first. Anything
     # unclassified keeps the verbose format. Full details always remain in
     # error_traceback and the request/response fields below.
-    classified = classify_error(exc)
+    #
+    # Explicit IntegrationError subclasses classify everywhere — they're
+    # unambiguous. Heuristic classification (status codes / connection
+    # exception types) is scoped to action-handler execution failures only
+    # (classify_heuristics=True), because the same signals mean something
+    # different elsewhere — e.g. a 401 from the Gundi portal's own
+    # get_integration_details call is a portal auth problem, not a
+    # third-party provider one, and must not render as "Authentication
+    # failed" (which would misdirect operators at the provider).
+    classified = classify_error(exc) if (classify_heuristics or isinstance(exc, IntegrationError)) else None
     if classified:
         message = format_classified_error(classified)
     else:
@@ -285,11 +295,13 @@ async def execute_action(
             asyncio.TimeoutError(f"Action '{action_id}' timed out"),
             integration_id, action_id,
             config_data={"configurations": [c.dict() for c in integration.configurations]},
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            classify_heuristics=True,
         )
     except Exception as e:
         return await _handle_error(e, integration_id, action_id,
-                                   config_data={"configurations": [c.dict() for c in integration.configurations]})
+                                   config_data={"configurations": [c.dict() for c in integration.configurations]},
+                                   classify_heuristics=True)
 
     # Success. Log the execution time and return the result
     end_time = time.monotonic()
