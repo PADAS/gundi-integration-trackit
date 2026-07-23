@@ -8,6 +8,8 @@ import httpx
 import pydantic
 import stamina
 
+from app.services.errors import IntegrationAuthError
+
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,9 @@ class TrackitBaseException(Exception):
         return f"{self.status_code}: {self.message}, Error: {self.error}"
 
 
-class TrackitUnauthorizedException(TrackitBaseException):
+class TrackitUnauthorizedException(TrackitBaseException, IntegrationAuthError):
+    """Also an IntegrationAuthError so activity logs report it as
+    "Authentication failed — ..." instead of the generic error format."""
     default_status_code = 401
 
 

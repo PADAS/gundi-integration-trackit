@@ -13,6 +13,7 @@ from app.actions.client import (
     TrackitInternalServerException,
     TrackitVehicle,
 )
+from app.services.errors import IntegrationAuthError, format_error_message
 
 
 BASE_URL = "https://genx.trackit.co.zw/webservice"
@@ -253,3 +254,18 @@ def test_vehicle_model_tolerates_unparseable_gps_time():
     # Unparseable time becomes None rather than raising and dropping the row.
     assert vehicle.gps_actual_time is None
     assert vehicle.imei == "353742376164273"
+
+
+def test_trackit_unauthorized_exception_is_classified_as_auth_error():
+    exc = TrackitUnauthorizedException("Unauthorized access", ValueError("original"))
+
+    assert isinstance(exc, IntegrationAuthError)
+    assert exc.status_code == 401  # default_status_code preserved through the MRO
+    assert format_error_message(exc) == "Authentication failed — Unauthorized access (HTTP 401)"
+
+
+def test_trackit_unauthorized_exception_keeps_explicit_status_code():
+    exc = TrackitUnauthorizedException("Forbidden", None, status_code=403)
+
+    assert exc.status_code == 403
+    assert format_error_message(exc) == "Authentication failed — Forbidden (HTTP 403)"
