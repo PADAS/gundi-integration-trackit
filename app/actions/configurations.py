@@ -110,7 +110,7 @@ class PullObservationsConfig(PullActionConfiguration):
     )
 
     class Config:
-        title = "Pull Observations"
+        title = "Connection Settings"
 
     @pydantic.validator("gps_utc_offset")
     def _validate_utc_offset(cls, v):

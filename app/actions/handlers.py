@@ -27,6 +27,10 @@ state_manager = IntegrationStateManager()
 
 
 TRACKIT_BASE_URL = "https://genx.trackit.co.zw/webservice"
+# Must match this handler's registered action id (the "action_" prefix stripped
+# from action_pull_observations); it keys the per-device dedup watermarks, so
+# changing one without the other silently resets dedup for the whole fleet.
+ACTION_ID = "pull_observations"
 OBSERVATIONS_BATCH_SIZE = 200
 # Positions timestamped further ahead than this are treated as device/config
 # clock errors: they are skipped rather than sent or stored, so a single bogus
@@ -65,23 +69,19 @@ def has_valid_position(vehicle: client.TrackitVehicle) -> bool:
     return True
 
 
-def parse_watermark(stored: str, device_tz: timezone) -> Optional[datetime]:
-    """Parse a stored watermark to a naive device-local datetime.
+def parse_watermark(stored: str) -> Optional[datetime]:
+    """Parse a stored watermark into a naive device-local datetime.
 
-    Watermarks are stored as the raw device timestamp (naive). Values written
-    by an earlier version were UTC-aware — convert those back to device-local
-    time with the configured offset so the comparison stays in one timescale.
-    An unparseable value is treated as absent (send + overwrite) so one corrupt
-    key can't turn the pull into a permanent crash loop.
+    Watermarks are stored as the raw device timestamp (naive), so parsing is a
+    plain ISO round-trip. An unparseable value is treated as absent (send +
+    overwrite) so one corrupt key can't turn the pull into a permanent crash
+    loop.
     """
     try:
-        dt = datetime.fromisoformat(stored)
+        return datetime.fromisoformat(stored)
     except (ValueError, TypeError):
         logger.warning(f"Unparseable stored watermark '{stored}'; treating as absent")
         return None
-    if dt.tzinfo:
-        return dt.astimezone(device_tz).replace(tzinfo=None)
-    return dt
 
 
 def transform(vehicle: client.TrackitVehicle, recorded_at: datetime) -> dict:
@@ -166,7 +166,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     # Prefetch the remaining devices' watermarks concurrently (bounded).
     states = await _gather_limited([
-        state_manager.get_state(integration_id=integration_id, action_id="pull_observations", source_id=vehicle.imei)
+        state_manager.get_state(integration_id=integration_id, action_id=ACTION_ID, source_id=vehicle.imei)
         for vehicle in unique_vehicles
     ])
 
@@ -177,7 +177,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # configured UTC offset — changing the offset can't silently gap data.
         stored = (device_state or {}).get("latest_gps_time")
         if stored:
-            watermark = parse_watermark(stored, device_tz)
+            watermark = parse_watermark(stored)
             if watermark and vehicle.gps_actual_time <= watermark:
                 logger.info(f"Skipping vehicle {vehicle.imei} (no new position since {stored})")
                 continue
@@ -213,7 +213,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         await _gather_limited([
             state_manager.set_state(
                 integration_id=integration_id,
-                action_id="pull_observations",
+                action_id=ACTION_ID,
                 state={"latest_gps_time": watermark},
                 source_id=obs["source"],
             )

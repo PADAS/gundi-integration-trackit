@@ -103,16 +103,10 @@ def test_has_valid_position():
     assert handlers.has_valid_position(VEHICLE.copy(update={"latitude": 0.0, "longitude": 0.0})) is False
 
 
-def test_parse_watermark_handles_naive_aware_and_corrupt():
-    plus_two = utc_offset_to_tzinfo("+2")
-    assert handlers.parse_watermark("2026-07-21T09:31:31", plus_two) == datetime(2026, 7, 21, 9, 31, 31)
-    # Legacy aware-UTC values convert back to device-local time with the
-    # configured offset (07:31 UTC == 09:31 at +2), not a bare tzinfo strip.
-    assert handlers.parse_watermark("2026-07-21T07:31:31+00:00", plus_two) == datetime(2026, 7, 21, 9, 31, 31)
-    minus_five = utc_offset_to_tzinfo("-5")
-    assert handlers.parse_watermark("2026-07-21T14:31:31+00:00", minus_five) == datetime(2026, 7, 21, 9, 31, 31)
+def test_parse_watermark_handles_naive_and_corrupt():
+    assert handlers.parse_watermark("2026-07-21T09:31:31") == datetime(2026, 7, 21, 9, 31, 31)
     # Corrupt values are treated as absent instead of crash-looping the pull.
-    assert handlers.parse_watermark("not-a-date", plus_two) is None
+    assert handlers.parse_watermark("not-a-date") is None
 
 
 @pytest.mark.asyncio
@@ -204,20 +198,6 @@ async def test_action_pull_observations_skips_already_sent_positions(
 
     mock_pull_dependencies["send_observations"].assert_not_awaited()
     mock_pull_dependencies["set_state"].assert_not_awaited()
-    assert result["observations_extracted"] == 0
-
-
-@pytest.mark.asyncio
-async def test_action_pull_observations_skips_legacy_aware_watermark(
-        mock_integration, pull_config, mock_pull_dependencies
-):
-    # Watermark written by the earlier version (aware UTC: 07:31 UTC == 09:31 at +2).
-    mock_pull_dependencies["get_state"].return_value = {"latest_gps_time": "2026-07-21T07:31:31+00:00"}
-
-    result = await handlers.action_pull_observations(mock_integration, pull_config)
-
-    # Same fix as the watermark -> deduped, no post-upgrade duplicate or gap.
-    mock_pull_dependencies["send_observations"].assert_not_awaited()
     assert result["observations_extracted"] == 0
 
 
