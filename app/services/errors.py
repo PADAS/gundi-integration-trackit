@@ -1,4 +1,8 @@
-from typing import Optional
+import asyncio
+from typing import NamedTuple, Optional
+
+import aiohttp
+import httpx
 
 
 class ActionNotFound(Exception):
@@ -58,3 +62,69 @@ class IntegrationRateLimitError(IntegrationError):
 class IntegrationBadResponseError(IntegrationError):
     error_type = "bad_response"
     default_title = "Unexpected response from the provider"
+
+
+class ClassifiedError(NamedTuple):
+    error_type: str
+    title: str
+    message: str
+    status_code: Optional[int]
+
+
+# Exceptions that mean the provider could not be reached at all.
+CONNECTIVITY_EXCEPTIONS = (
+    asyncio.TimeoutError,
+    ConnectionError,  # builtin: covers ConnectionRefusedError, ConnectionResetError, etc.
+    httpx.TransportError,  # covers ConnectError, ReadTimeout, and all transport failures
+    aiohttp.ClientConnectionError,
+)
+
+
+def classify_error(exc: Exception) -> Optional[ClassifiedError]:
+    """Classify a third-party failure for consistent activity-log reporting.
+
+    Explicitly raised `IntegrationError` subclasses always win. Otherwise fall
+    back to heuristics based on signals the action runner already reads
+    (`exc.response.status_code`, exception type). Returns None when the error
+    can't be classified — callers keep the generic format.
+    """
+    if isinstance(exc, IntegrationError):
+        return ClassifiedError(
+            error_type=exc.error_type,
+            title=exc.default_title,
+            message=getattr(exc, "message", None) or "",
+            status_code=getattr(exc, "status_code", None),
+        )
+
+    # Use getattr (not truthiness): httpx error responses are falsy.
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code in (401, 403):
+        return ClassifiedError("auth", IntegrationAuthError.default_title, str(exc), status_code)
+    if status_code == 429:
+        return ClassifiedError("rate_limit", IntegrationRateLimitError.default_title, str(exc), status_code)
+    if status_code is not None and status_code >= 500:
+        return ClassifiedError("bad_response", IntegrationBadResponseError.default_title, str(exc), status_code)
+    if isinstance(exc, CONNECTIVITY_EXCEPTIONS):
+        return ClassifiedError("connectivity", IntegrationConnectionError.default_title, str(exc), None)
+    return None
+
+
+def format_classified_error(classified: ClassifiedError) -> str:
+    """Build the clean text: "<title> — <message> (HTTP <status>)".
+
+    The portal prepends "Error running action '<id>': " to this string, so it
+    must be short and lead with what an operator needs to see. The message
+    segment is skipped when redundant; the HTTP suffix when unknown.
+    """
+    text = classified.title
+    if classified.message and classified.message != classified.title:
+        text = f"{text} — {classified.message}"
+    if classified.status_code:
+        text = f"{text} (HTTP {classified.status_code})"
+    return text
+
+
+def format_error_message(exc: Exception) -> Optional[str]:
+    """Return clean, human-first error text for classified errors, or None."""
+    classified = classify_error(exc)
+    return format_classified_error(classified) if classified else None
