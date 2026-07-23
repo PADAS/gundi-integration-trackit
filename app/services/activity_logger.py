@@ -26,6 +26,7 @@ from gundi_core.events import (
     CustomWebhookLog,
 )
 from app import settings
+from app.services.errors import format_error_message
 
 
 logger = logging.getLogger(__name__)
@@ -154,7 +155,7 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
                                 integration_id=integration_id,
                                 action_id=action_id,
                                 config_data=config_data,
-                                error=str(e)
+                                error=format_error_message(e) or str(e)
                             )
                         ),
                         topic_name=settings.INTEGRATION_EVENTS_TOPIC,
