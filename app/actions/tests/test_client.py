@@ -178,6 +178,22 @@ async def test_get_live_data_omits_imei_nos_when_not_given():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_get_live_data_omits_company_names_when_not_given():
+    # Some accounts map to a single company; omitting the filter returns all
+    # vehicles visible to the login, so company_names must be optional.
+    route = respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
+        json={"root": {"VehicleData": []}}
+    )
+
+    vehicles = await get_live_data(BASE_URL, "token123", 37)
+
+    assert route.called
+    assert b"company_names" not in route.calls.last.request.content
+    assert vehicles == []
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_get_live_data_no_company_found():
     respx.post(BASE_URL, params={"token": "getTokenBaseLiveData", "ProjectId": 37}).respond(
         json={"result": 0, "message": "No Company Found"}

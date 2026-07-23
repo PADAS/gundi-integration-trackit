@@ -192,11 +192,13 @@ async def get_live_data(
         base_url: str,
         token: str,
         project_id: int,
-        company_names: str,
+        company_names: Optional[str] = None,
         imei_nos: Optional[str] = None,
         session: Optional[httpx.AsyncClient] = None,
 ) -> List[TrackitVehicle]:
-    body = {"company_names": company_names, "format": "json"}
+    body = {"format": "json"}
+    if company_names:
+        body["company_names"] = company_names
     if imei_nos:
         body["imei_nos"] = imei_nos
 

@@ -77,10 +77,10 @@ class PullObservationsConfig(PullActionConfiguration):
             widget="hidden",
         ),
     )
-    company_names: str = FieldWithUIOptions(
-        ...,
+    company_names: OptionalStringType = FieldWithUIOptions(
+        None,
         title="Company Name",
-        description="The TrackIt company to pull vehicle data for (a single company per integration)",
+        description="Optional. The TrackIt company to pull vehicle data for. Leave empty to pull all vehicles visible to this account (only one company can be given).",
     )
     imei_nos: OptionalStringType = FieldWithUIOptions(
         None,
